@@ -1,7 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -30,6 +30,10 @@ const CALL_TIMEOUT_MS = 2_147_483_647;
 const STDERR_CAPTURE_MAX_CHARS = 1024 * 1024;
 const STATUS_WIDGET_KEY = "ida-mcp:status-bar";
 const STATUS_HIDE_DELAY_MS = 4000;
+// OMP reports every MCP server's connection state on this event-bus channel and
+// renders it as one combined status line; the widget is only for Pi.
+const OMP_MCP_STATUS_CHANNEL = "mcp:connection-status";
+const OMP_MCP_SERVER_NAME = "ida";
 const DISCOVERABLE_TOOLS_FLAG = "ida-tools-discoverable";
 
 type PiContent =
@@ -114,6 +118,7 @@ export default function idaMcp(pi: ExtensionAPI) {
     | undefined;
 
   const clearStatusWidget = (ctx: ExtensionContext) => {
+    if (agentKind === "omp") return;
     if (statusHideTimer) {
       clearTimeout(statusHideTimer);
       statusHideTimer = undefined;
@@ -129,6 +134,23 @@ export default function idaMcp(pi: ExtensionAPI) {
     state: "starting" | "ready" | "error",
     detail?: string | string[],
   ) => {
+    if (agentKind === "omp") {
+      const details = detail ? (Array.isArray(detail) ? detail : [detail]) : [];
+      pi.events.emit(
+        OMP_MCP_STATUS_CHANNEL,
+        state === "starting"
+          ? { type: "connecting", serverNames: [OMP_MCP_SERVER_NAME] }
+          : state === "ready"
+            ? { type: "connected", serverName: OMP_MCP_SERVER_NAME }
+            : {
+                type: "failed",
+                serverName: OMP_MCP_SERVER_NAME,
+                error: details.join(" — ") || "startup failed",
+              },
+      );
+      return;
+    }
+
     if (statusHideTimer) {
       clearTimeout(statusHideTimer);
       statusHideTimer = undefined;
@@ -207,7 +229,7 @@ export default function idaMcp(pi: ExtensionAPI) {
       command: "uv",
       args: [
         "run",
-        "--frozen",
+        "--no-dev",
         "ida-mcp",
         "stdio",
         `--agent=${agentKind}`,
@@ -285,10 +307,22 @@ export default function idaMcp(pi: ExtensionAPI) {
                 throw new Error("The Hex-Rays IDA MCP server is not connected");
 
               const sessionPath = ctx.sessionManager.getSessionFile();
+              const args = params as Record<string, unknown>;
+              const path = args.path;
+              // The MCP server runs from PACKAGE_ROOT; agent paths use ctx.cwd.
+              // Leave home paths for Nexus to expand on the server side.
+              const forwardedArgs =
+                tool.name === "open_database" &&
+                typeof path === "string" &&
+                path.length > 0 &&
+                !isAbsolute(path) &&
+                !path.startsWith("~")
+                  ? { ...args, path: resolve(ctx.cwd, path) }
+                  : args;
               const result = await client.callTool(
                 {
                   name: tool.name,
-                  arguments: params as Record<string, unknown>,
+                  arguments: forwardedArgs,
                   ...(sessionPath
                     ? { _meta: { [sessionPathField]: sessionPath } }
                     : {}),
